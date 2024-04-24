@@ -6,11 +6,86 @@ using Plots
 using Random
 using LinearAlgebra
 using Statistics
+using DelimitedFiles
 
 
+#Optdigits 8x8 helper functions exports
+export optdigits_data_processing, plot_single_optdigits_digit, create_optdigits_batches_with_labels
+
+#MNIST 28x28 helper functions exports
 export read_ubyte_images, read_mnist_labels, create_batches_with_labels, plot_ubyte_image
 
-export DenseLayer, NeuralNetwork, forward_pass, relu, relu_derivative, softmax, softmax_derivative, linear_layer_derivative, linear_layer_identity, CostFunction, SquareCost, cost, derivative, backpropagation_pass, changing_weights
+#neural network structs and functions
+export DenseLayer, NeuralNetwork, Optimizer, ADAM_Optimizer, Simple_Subtract, forward_pass, relu, relu_derivative, softmax, softmax_derivative, linear_layer_derivative, linear_layer_identity, CostFunction, SquareCost, CrossEntropy, cost, derivative, backpropagation_pass, changing_weights, clip_gradients!
+
+#extra functions
+export normalize_matrix_to_one
+
+
+
+function normalize_matrix_to_one(matrix::Matrix{Float64})
+    # Compute the sum of absolute values of all elements in the matrix
+    sum_abs = sum(abs.(matrix))
+    
+    if sum_abs == 0
+        return matrix  # Return the original matrix if sum of absolute values is zero to avoid division by zero
+    else
+        return matrix / sum_abs  # Normalize each element in the matrix
+    end
+end
+
+#=
+Optdigits readout
+
+functions for reading dataset, plotting and batching
+=#
+
+function optdigits_data_processing(filename::String; do_batch = true, batch_size = 10)
+    data = readdlm(filename, ',', Int64)
+    features = Float64.(data[:,1:64])/16
+    labels = one_hot_optdigits_labels(data[:,65])
+    if do_batch
+        feature_batches, label_batches = create_optdigits_batches_with_labels(features, labels, batch_size)
+        return feature_batches, label_batches
+    end
+    return features, labels
+end
+
+function one_hot_optdigits_labels(labels::Vector{Int64})
+    num_labels = size(labels, 1)
+    labels_one_hot = Array{Float64}(undef, num_labels, 10)
+    fill!(labels_one_hot, 0.0)
+
+    for i in 1:num_labels
+        label = labels[i]
+        labels_one_hot[i, label + 1] = 1.0
+    end
+    return labels_one_hot
+end
+
+function plot_single_optdigits_digit(features::Matrix{Float64}, labels::Matrix{Float64}; index::Int64=1)
+    pixel_values = features[index,:]
+    image = reshape(pixel_values, 8, 8)
+    label = labels[:,index]
+    # Plot the image
+    image = rotl90(image)
+    plot = heatmap(image, color=:grays, axis=false, colorbar=false, aspect_ratio=:equal, title="Label: $(label)")
+    xlims!(plot, (1,8)); ylims!(plot, (1,8))
+    return plot
+end
+
+function create_optdigits_batches_with_labels(features::Matrix{Float64}, labels::Matrix{Float64}, batch_size::Int64)
+    num_samples = size(features, 1)
+    permuted_indices = randperm(num_samples)
+    shuffled_images = features[permuted_indices, :]
+    shuffled_labels = labels[permuted_indices, :]
+    image_batches = [shuffled_images[i:min(i + batch_size - 1, num_samples), :] for i in 1:batch_size:num_samples]
+    label_batches = [shuffled_labels[i:min(i + batch_size - 1, num_samples), :] for i in 1:batch_size:num_samples]
+    #ensures all batches to have the same dimensions
+    pop!(image_batches)
+    pop!(label_batches)
+    return image_batches, label_batches
+end
 
 #=
 MNIST readout
@@ -93,7 +168,8 @@ Fully Connected Feed Forward Neural Network
 functions and structures for constructing neural network, its inference, backpropagation and weight updates
 =#
 
-struct DenseLayer
+#shouldn't be mutable
+mutable struct DenseLayer
     weights::Matrix{Float64}
     bias::Vector{Float64}
     activation::Function
@@ -101,13 +177,17 @@ struct DenseLayer
 end
 
 #initialization
-function DenseLayer(input_dim::Int, output_dim::Int, activation::Function, activation_derivative::Function)
+function DenseLayer(input_dim::Int, output_dim::Int, activation::Function, activation_derivative::Function, add_bias::Bool=false)
     weights = randn(Float64, output_dim, input_dim) * sqrt(2.0 / input_dim)  # Ensure input_dim and output_dim are Integers
     bias = zeros(Float64, output_dim)
+    if add_bias
+        bias = randn(Float64, output_dim)
+    end
     return DenseLayer(weights, bias, activation, activation_derivative)
 end
 
-struct NeuralNetwork
+#shouldn't be mutable
+mutable struct NeuralNetwork
     layers::Vector{DenseLayer}
     #activations serve purpose of calculating gradient without repeating inference
     activations::Vector{Vector{Float64}}
@@ -164,13 +244,14 @@ function relu_derivative(x::AbstractVector)
 end
 
 function softmax(x::AbstractVector)
-    exp_x = exp.(x .- maximum(x))  # Subtract max for numerical stability
+    exp_x = exp.(x)
     return exp_x ./ sum(exp_x)
 end
 
 function softmax_derivative(x::AbstractArray)
-    softmax_vals = softmax(x)
-    return softmax_vals .* (1 .- softmax_vals)
+    #softmax(x) would work correctly if this function wasn't working on softmax output already
+    #x = softmax(x)
+    return x .* (1 .- x)
 end
 
 linear_layer_identity(x) = x 
@@ -178,6 +259,7 @@ linear_layer_derivative(x) = Ones(size(x))
 
 abstract type CostFunction end
 struct SquareCost <: CostFunction end
+struct CrossEntropy <: CostFunction end
 
 #interface generics
 cost(::CostFunction, output, label) = error("Not implemented") #cost
@@ -187,13 +269,21 @@ derivative(::CostFunction, output, label) = error("Not implemented") #costs deri
 cost(::SquareCost, output, label) = sum((output - label) .^ 2)
 derivative(::SquareCost, output, label) = 2 .* (output .- label)
 
+function cost(::CrossEntropy, output, label)
+    clamped_output = clamp.(output, eps(Float64), 1.0 - eps(Float64))
+    return -dot(label, log.(clamped_output .+ 1e-12))
+end
+
+function derivative(::CrossEntropy, output, label)
+    clamped_output = clamp.(output, eps(Float64), 1.0 - eps(Float64))
+    return -label ./ (clamped_output .+ 1e-12)
+end
+
 function backpropagation_pass(model::NeuralNetwork, output::Vector{Float64}, label::Vector{Float64}, costModel::CostFunction)
     delta_L =  model.layers[end].activation_derivative(
         derivative(costModel, output, label)
     )
     delta_l_previous = delta_L
-
-    #for bigger nets it should be a global variable of given dimensions, to prevent lag during computation
     gradients = Vector{Matrix{Float64}}()
     
     #iterating through full array
@@ -211,10 +301,49 @@ function backpropagation_pass(model::NeuralNetwork, output::Vector{Float64}, lab
     #changing weights
     return gradients
 end
-function changing_weights(model::NeuralNetwork, gradients::Vector{Matrix{Float64}}, step_epsilon::Float64)
+
+abstract type Optimizer end
+struct Simple_Subtract <: Optimizer end
+
+struct ADAM_Optimizer <: Optimizer
+    first_moment::Vector{Matrix{Float64}}
+    first_decay_rate::Float64
+    second_moment::Vector{Matrix{Float64}}
+    second_decay_rate::Float64
+end
+
+function ADAM_Optimizer(model::NeuralNetwork)
+    zero_initialization_1 = [zeros(size(l.weights)) for l in model.layers]
+    zero_initialization_2 = [zeros(size(l.weights)) for l in model.layers]
+    return ADAM_Optimizer(zero_initialization_1, 0.9, zero_initialization_2, 0.999)
+end
+
+function changing_weights(optimizer_model::Optimizer,model::NeuralNetwork, gradients::Vector{Matrix{Float64}}, learning_rate::Float64)
+    error("Function not implemented for Optimizer type")
+end
+
+function changing_weights(optimizer_model::Simple_Subtract, model::NeuralNetwork, gradients::Vector{Matrix{Float64}}, learning_rate::Float64, timestep::Int64)
     for i in 1:length(model.layers)
-        model.layers[i].weights .-= (step_epsilon .* gradients[i])
+        model.layers[i].weights .-= (learning_rate .* gradients[i])
     end 
 end
+
+#there are problems with this implementation - mainly that gradients do not add up well with these operators
+function changing_weights(optimizer_model::ADAM_Optimizer, model::NeuralNetwork, gradients::Vector{Matrix{Float64}}, learning_rate::Float64, timestep::Int64)
+    epsilon = eps(Float64)
+
+    for iter in 1:size(model.layers,1)
+        optimizer_model.first_moment[iter] = optimizer_model.first_decay_rate .* optimizer_model.first_moment[iter] .+ (1-optimizer_model.first_decay_rate) .*gradients[iter]
+
+        optimizer_model.second_moment[iter] = optimizer_model.second_decay_rate .* optimizer_model.second_moment[iter] .+ (1-optimizer_model.second_decay_rate) .*gradients[iter].^2
+
+        cor_bias_first_moment = optimizer_model.first_moment[iter]./(1-optimizer_model.first_decay_rate^timestep)
+
+        cor_bias_second_moment = optimizer_model.second_moment[iter]./(1-optimizer_model.second_decay_rate^timestep)
+
+        model.layers[iter].weights .-= learning_rate .* cor_bias_first_moment./(sqrt.(cor_bias_second_moment).+epsilon)
+    end
+end
+
 
 end
